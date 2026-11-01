@@ -156,6 +156,23 @@ if [[ "${DEV_MODE}" != "1" ]]; then
     cp "${CONFIG_SRC}/dxvk.conf" "${APP}/GameData/dxvk.conf"
     cp "${CONFIG_SRC}/Options.ini" "${APP}/GameData/DefaultOptions.ini"
     echo "    bundled $(du -sh "${APP}/GameData" | cut -f1) of game data"
+else
+    # Keep GameData absent so the engine reads user-supplied assets from Documents.
+    # Small redistributable fonts/config are staged separately and copied into
+    # Documents on first launch (without overwriting user customisations).
+    echo "==> Embedding lite first-launch resources"
+    [[ -d "${FONTS_SRC}" ]] || { echo "ERROR: run stage-fonts.sh first" >&2; exit 1; }
+    mkdir -p "${APP}/Bootstrap/fonts"
+    for font in arial.ttf arialbold.ttf couriernew.ttf timesnewroman.ttf; do
+        [[ -f "${FONTS_SRC}/${font}" ]] || { echo "ERROR: missing staged font ${font}" >&2; exit 1; }
+        cp "${FONTS_SRC}/${font}" "${APP}/Bootstrap/fonts/"
+    done
+    for cfg in dxvk.conf Options.ini; do
+        [[ -f "${CONFIG_SRC}/${cfg}" ]] || { echo "ERROR: missing config ${cfg}" >&2; exit 1; }
+    done
+    cp "${CONFIG_SRC}/dxvk.conf" "${APP}/Bootstrap/dxvk.conf"
+    cp "${CONFIG_SRC}/Options.ini" "${APP}/Bootstrap/DefaultOptions.ini"
+    echo "    game assets excluded; lite bootstrap embedded"
 fi
 
 # Loose icon PNGs alongside the compiled asset catalog: SpringBoard on some
