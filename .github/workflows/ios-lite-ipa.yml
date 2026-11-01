@@ -1,0 +1,51 @@
+name: iOS Lite IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/ios-lite-ipa]
+    paths:
+      - '.github/workflows/ios-lite-ipa.yml'
+      - 'scripts/build/ios/**'
+      - 'ios/**'
+      - 'CMakePresets.json'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'ffc071e0c08432c60c9b64f00334c0227667931b'
+      - name: Install build dependencies
+        run: |
+          brew install cmake ninja meson pkgconf xcodegen glslang sdl3 ffmpeg freetype fontconfig autoconf autoconf-archive automake libtool
+      - name: Install Vulkan SDK
+        run: |
+          curl -fL --retry 3 'https://sdk.lunarg.com/sdk/download/1.4.341.1/mac/vulkansdk-macos-1.4.341.1.zip' -o /tmp/vulkan.zip
+          unzip -q /tmp/vulkan.zip -d /tmp/vulkan
+          find /tmp/vulkan -name vulkan_setup_env.sh -print
+          SDK_ENV="$(find /tmp/vulkan -name vulkan_setup_env.sh -print -quit)"
+          test -n "$SDK_ENV"
+          echo "VULKAN_SDK=$(dirname "$SDK_ENV")" >> "$GITHUB_ENV"
+      - name: Prepare iOS frameworks
+        run: |
+          ./scripts/build/ios/fetch-moltenvk.sh
+          ./scripts/build/ios/stage-fonts.sh
+      - name: Build iOS engine
+        run: |
+          cmake --preset ios-vulkan
+          cmake --build build/ios-vulkan --target z_generals --parallel 4
+      - name: Assemble unsigned app
+        run: |
+          GX_UNSIGNED=1 GX_BUNDLE_ID=com.fares.generalszh ./scripts/build/ios/package-ios-zh.sh --dev
+          bash scripts/build/ios/make-lite-ipa.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GeneralsXZH-lite-unsigned-ipa
+          path: build/GeneralsXZH-lite-unsigned.ipa
+          if-no-files-found: error
