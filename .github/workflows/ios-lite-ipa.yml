@@ -9,6 +9,8 @@ on:
       - 'ios/**'
       - 'CMakePresets.json'
       - 'vcpkg.json'
+      - 'Patches/**'
+      - 'cmake/**'
       - 'GeneralsMD/Code/Main/SDL3Main.cpp'
 permissions:
   contents: read
