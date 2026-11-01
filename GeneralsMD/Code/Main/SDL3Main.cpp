@@ -365,6 +365,39 @@ int main(int argc, char* argv[])
 				fprintf(stderr, "WARNING: chdir(%s) failed: %s\n", docs, strerror(errno));
 			} else {
 				fprintf(stderr, "INFO: iOS working directory (Documents): %s\n", docs);
+				// Lite IPA: seed only redistributable fonts and default configuration.
+				// Leave proprietary game assets in Documents for the user to import.
+				// Never overwrite anything the user has already copied or customized.
+				if (bundleData[0] != '\0') {
+					const std::filesystem::path bootstrap =
+						std::filesystem::path(bundleData).parent_path() / "Bootstrap";
+					std::error_code ec;
+					const std::filesystem::path fontsDst = std::filesystem::path(docs) / "fonts";
+					std::filesystem::create_directories(fontsDst, ec);
+					for (const char *font : {"arial.ttf", "arialbold.ttf", "couriernew.ttf", "timesnewroman.ttf"}) {
+						const auto source = bootstrap / "fonts" / font;
+						if (std::filesystem::is_regular_file(source, ec)) {
+							std::filesystem::copy_file(source, fontsDst / font,
+								std::filesystem::copy_options::skip_existing, ec);
+						}
+						ec.clear();
+					}
+					const auto dxvkConfig = bootstrap / "dxvk.conf";
+					if (std::filesystem::is_regular_file(dxvkConfig, ec)) {
+						std::filesystem::copy_file(dxvkConfig, std::filesystem::path(docs) / "dxvk.conf",
+							std::filesystem::copy_options::skip_existing, ec);
+					}
+					ec.clear();
+					const auto defaultOptions = bootstrap / "DefaultOptions.ini";
+					if (std::filesystem::is_regular_file(defaultOptions, ec)) {
+						const std::filesystem::path userDir =
+							std::filesystem::path(home) / "Library/Application Support/GeneralsX/GeneralsZH";
+						std::filesystem::create_directories(userDir, ec);
+						ec.clear();
+						std::filesystem::copy_file(defaultOptions, userDir / "Options.ini",
+							std::filesystem::copy_options::skip_existing, ec);
+					}
+				}
 			}
 		}
 
