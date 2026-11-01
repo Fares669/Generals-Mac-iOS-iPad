@@ -58,6 +58,7 @@ xcodebuild -project "${IOS_DIR}/${APP_NAME}.xcodeproj" \
     -derivedDataPath "${DERIVED}" \
     DEVELOPMENT_TEAM="${TEAM_ID}" \
     PRODUCT_BUNDLE_IDENTIFIER="${BUNDLE_ID}" \
+    CODE_SIGNING_ALLOWED="$( [[ "${GX_UNSIGNED:-0}" == "1" ]] && echo NO || echo YES )" \
     -allowProvisioningUpdates build | tail -3
 
 SHELL_APP="${DERIVED}/Build/Products/Release-iphoneos/${APP_NAME}.app"
@@ -170,6 +171,12 @@ fi
 
 # Point the executable's rpath at the embedded frameworks
 install_name_tool -add_rpath "@executable_path/Frameworks" "${APP}/${APP_NAME}" 2>/dev/null || true
+
+if [[ "${GX_UNSIGNED:-0}" == "1" ]]; then
+    echo "==> Unsigned app assembled (requires signing before device installation)"
+    echo "==> App ready: ${APP}"
+    exit 0
+fi
 
 echo "==> Re-signing"
 ENTITLEMENTS="${OUT_DIR}/entitlements.plist"
