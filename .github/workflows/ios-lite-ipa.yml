@@ -8,6 +8,8 @@ on:
       - 'scripts/build/ios/**'
       - 'ios/**'
       - 'CMakePresets.json'
+      - 'vcpkg.json'
+      - 'GeneralsMD/Code/Main/SDL3Main.cpp'
 permissions:
   contents: read
 jobs:
@@ -15,12 +17,12 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
       - uses: lukka/run-vcpkg@v11
         with:
-          vcpkgGitCommitId: 'ffc071e0c08432c60c9b64f00334c0227667931b'
+          vcpkgGitCommitId: '9a5dfef5d1a0438a7d24856a85bd60f309d355e9'
       - name: Install build dependencies
         run: |
           brew install cmake ninja meson pkgconf xcodegen glslang sdl3 ffmpeg freetype fontconfig autoconf autoconf-archive automake libtool
