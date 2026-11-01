@@ -12,6 +12,7 @@ on:
       - 'Patches/**'
       - 'cmake/**'
       - 'GeneralsMD/Code/Main/SDL3Main.cpp'
+      - 'Core/GameEngineDevice/Source/OpenALAudioDevice/**'
 permissions:
   contents: read
 jobs:
@@ -55,6 +56,31 @@ jobs:
         run: |
           GX_UNSIGNED=1 GX_BUNDLE_ID=com.fares.generalszh ./scripts/build/ios/package-ios-zh.sh --dev
           bash scripts/build/ios/make-lite-ipa.sh
+      - name: Validate unsigned IPA structure and iOS binaries
+        run: |
+          set -euo pipefail
+          APP="build/ios-package/GeneralsXZH.app"
+          IPA="build/GeneralsXZH-lite-unsigned.ipa"
+          test -s "$IPA"
+          unzip -tqq "$IPA"
+          test -f "$APP/GeneralsXZH"
+          test -f "$APP/Info.plist"
+          test -f "$APP/Bootstrap/dxvk.conf"
+          test -f "$APP/Bootstrap/DefaultOptions.ini"
+          for font in arial.ttf arialbold.ttf couriernew.ttf timesnewroman.ttf; do
+            test -f "$APP/Bootstrap/fonts/$font"
+          done
+          for lib in libdxvk_d3d8.0.dylib libdxvk_d3d9.0.dylib libSDL3.0.dylib libSDL3_image.0.dylib libopenal.1.dylib; do
+            test -f "$APP/Frameworks/$lib"
+          done
+          test -f "$APP/Frameworks/MoltenVK.framework/MoltenVK"
+          test ! -d "$APP/GameData"
+          test ! -f "$APP/embedded.mobileprovision"
+          xcrun lipo -verify_arch arm64 "$APP/GeneralsXZH"
+          xcrun lipo -verify_arch arm64 "$APP/Frameworks/MoltenVK.framework/MoltenVK"
+          test "$(plutil -extract CFBundleIdentifier raw "$APP/Info.plist")" = "com.fares.generalszh"
+          test "$(plutil -extract MinimumOSVersion raw "$APP/Info.plist")" = "16.0"
+          echo "IPA contents and architecture verified."
       - uses: actions/upload-artifact@v4
         with:
           name: GeneralsXZH-lite-unsigned-ipa
