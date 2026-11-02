@@ -43,6 +43,8 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <string>
+#include <fstream>
+#include <unordered_map>
 #endif
 #include <cstdlib>
 #include <cctype>
@@ -50,6 +52,10 @@
 #include <cstdio>
 #include <unistd.h>   // _exit()
 #include <glob.h>     // glob() for Vulkan ICD discovery
+#if defined(__APPLE__) && (!defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE)
+#include <execinfo.h>
+#include <signal.h>
+#endif
 
 // USER INCLUDES (match WinMain.cpp pattern)
 #include "Lib/BaseType.h"
@@ -61,6 +67,10 @@
 #include "Common/Debug.h"
 #include "Common/version.h"  // GeneralsX @bugfix BenderAI 14/02/2026 Version class + TheVersion extern
 #include "SDL3GameEngine.h"
+
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+#include "IOSProfileLauncher.h"
+#endif
 
 // DXVK WSI
 #define DXVK_WSI_SDL3 1
@@ -245,9 +255,852 @@ GameEngine *CreateGameEngine(void)
  * @param argv Command line arguments
  * @return Exit code (0 = success)
  */
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+static std::string IOSContraTrim(const std::string &value)
+{
+    size_t first = 0;
+    while (first < value.size() && std::isspace((unsigned char)value[first]))
+        ++first;
+
+    size_t last = value.size();
+    while (last > first && std::isspace((unsigned char)value[last - 1]))
+        --last;
+
+    return value.substr(first, last - first);
+}
+
+static std::string IOSContraLower(std::string value)
+{
+    for (char &c : value)
+        c = (char)std::tolower((unsigned char)c);
+    return value;
+}
+
+static bool IOSContraEndsWith(const std::string &value, const char *suffix)
+{
+    const size_t suffixLength = strlen(suffix);
+    return value.size() >= suffixLength &&
+           value.compare(value.size() - suffixLength, suffixLength, suffix) == 0;
+}
+
+static std::filesystem::path IOSContraSettingsPath()
+{
+    const char *home = getenv("HOME");
+    if (home == nullptr || home[0] == '\0')
+        return std::filesystem::path("ContraSettings.ini");
+    return std::filesystem::path(home) / "Documents" / "ContraSettings.ini";
+}
+
+static std::unordered_map<std::string, std::string> IOSLoadContraSettings()
+{
+    std::unordered_map<std::string, std::string> values;
+    std::ifstream input(IOSContraSettingsPath());
+    std::string line;
+    while (std::getline(input, line))
+    {
+        line = IOSContraTrim(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';')
+            continue;
+
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos)
+            continue;
+
+        std::string key = IOSContraLower(IOSContraTrim(line.substr(0, equals)));
+        std::string value = IOSContraTrim(line.substr(equals + 1));
+        if (!key.empty())
+            values[key] = value;
+    }
+    return values;
+}
+
+static std::string IOSContraSetting(
+    const std::unordered_map<std::string, std::string> &settings,
+    const char *key,
+    const char *fallback)
+{
+    auto it = settings.find(IOSContraLower(key));
+    return it == settings.end() || it->second.empty() ? fallback : it->second;
+}
+
+static bool IOSContraSettingBool(
+    const std::unordered_map<std::string, std::string> &settings,
+    const char *key,
+    bool fallback)
+{
+    std::string value = IOSContraLower(IOSContraSetting(settings, key, fallback ? "Yes" : "No"));
+    return value == "yes" || value == "true" || value == "1" || value == "on";
+}
+
+static std::filesystem::path IOSEnhancedSettingsPath()
+{
+    const char *home = getenv("HOME");
+    if (home == nullptr || home[0] == '\0')
+        return std::filesystem::path("EnhancedSettings.ini");
+    return std::filesystem::path(home) / "Documents" / "EnhancedSettings.ini";
+}
+
+static std::unordered_map<std::string, std::string> IOSLoadEnhancedSettings()
+{
+    std::unordered_map<std::string, std::string> values;
+    std::ifstream input(IOSEnhancedSettingsPath());
+    std::string line;
+    while (std::getline(input, line))
+    {
+        line = IOSContraTrim(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';')
+            continue;
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos)
+            continue;
+        std::string key = IOSContraLower(IOSContraTrim(line.substr(0, equals)));
+        std::string value = IOSContraTrim(line.substr(equals + 1));
+        if (!key.empty())
+            values[key] = value;
+    }
+    return values;
+}
+
+static std::string IOSEnhancedSetting(
+    const std::unordered_map<std::string, std::string> &settings,
+    const char *key,
+    const char *fallback)
+{
+    auto it = settings.find(IOSContraLower(key));
+    return it == settings.end() || it->second.empty() ? fallback : it->second;
+}
+
+static bool IOSContraCoreArchive(const std::string &logicalCtr)
+{
+    static const char *required[] = {
+        "_ini.ctr",
+        "_maps.ctr",
+        "_ai.ctr",
+        "_terrain.ctr",
+        "_textures.ctr",
+        "_w3d.ctr",
+        "_window.ctr",
+        "_audio.ctr",
+        "_gamedata.ctr",
+        "_patch1.ctr",
+        nullptr
+    };
+
+    for (int i = 0; required[i] != nullptr; ++i)
+    {
+        if (IOSContraEndsWith(logicalCtr, required[i]))
+            return true;
+    }
+    return false;
+}
+
+static bool IOSContraArchiveShouldBeActive(
+    const std::filesystem::path &source,
+    const std::unordered_map<std::string, std::string> &settings)
+{
+    std::string lower = IOSContraLower(source.filename().string());
+    const bool distributedActive = IOSContraEndsWith(lower, ".big");
+
+    if (distributedActive)
+        lower.replace(lower.size() - 4, 4, ".ctr");
+
+    if (IOSContraCoreArchive(lower))
+        return true;
+
+    const std::string voices = IOSContraLower(IOSContraSetting(settings, "UnitVoices", "English"));
+    if (IOSContraEndsWith(lower, "_unitvoicesenglish.ctr"))
+        return voices != "native";
+    if (IOSContraEndsWith(lower, "_unitvoicesnative.ctr"))
+        return voices == "native";
+
+    const std::string hotkeys = IOSContraLower(IOSContraSetting(settings, "Hotkeys", "Original"));
+    const std::string hotkeyLanguage =
+        IOSContraLower(IOSContraSetting(settings, "HotkeyLanguage", "English"));
+    if (IOSContraEndsWith(lower, "_hotkeysoriginal_english.ctr"))
+        return hotkeys == "original" && hotkeyLanguage == "english";
+    if (IOSContraEndsWith(lower, "_hotkeysoriginal_russian.ctr"))
+        return hotkeys == "original" && hotkeyLanguage == "russian";
+    if (IOSContraEndsWith(lower, "_hotkeysleikeze_english.ctr"))
+        return hotkeys == "leikeze" && hotkeyLanguage == "english";
+    if (IOSContraEndsWith(lower, "_hotkeysleikeze_russian.ctr"))
+        return hotkeys == "leikeze" && hotkeyLanguage == "russian";
+
+    const std::string controlBar = IOSContraLower(IOSContraSetting(settings, "ControlBar", "Contra"));
+    if (IOSContraEndsWith(lower, "_controlbarpro.ctr"))
+        return controlBar == "pro";
+    if (IOSContraEndsWith(lower, "_controlbarstandard.ctr"))
+        return controlBar == "standard";
+
+    const std::string cameos = IOSContraLower(IOSContraSetting(settings, "Cameos", "Standard"));
+    if (IOSContraEndsWith(lower, "_cameoshd.ctr"))
+        return cameos == "hd";
+
+    const std::string music = IOSContraLower(IOSContraSetting(settings, "Music", "Standard"));
+    if (IOSContraEndsWith(lower, "_musicenhanced.ctr") || IOSContraEndsWith(lower, "_newmusic.ctr"))
+        return music == "enhanced";
+    if (IOSContraEndsWith(lower, "_musicthescore.ctr"))
+        return music == "the score";
+
+    const std::string portraits = IOSContraLower(IOSContraSetting(settings, "Portraits", "Standard"));
+    if (IOSContraEndsWith(lower, "_funnygeneralportraits.ctr"))
+        return portraits == "funny";
+
+    if (IOSContraEndsWith(lower, "_disablefogeffects.ctr"))
+        return !IOSContraSettingBool(settings, "FogEffects", false);
+    if (IOSContraEndsWith(lower, "_disablewatereffects.ctr"))
+        return !IOSContraSettingBool(settings, "WaterEffects", true);
+    if (IOSContraEndsWith(lower, "_disableextrabuildingprops.ctr"))
+        return !IOSContraSettingBool(settings, "ExtraBuildingProps", true);
+
+    // Keep unknown distributed .big files active and unknown .ctr files inactive.
+    return distributedActive;
+}
+
+static bool IOSPrepareContraRuntimeProfile(
+    const char *sourceProfilePath,
+    char *runtimePath,
+    size_t runtimePathSize,
+    bool *forceFullViewport)
+{
+    if (sourceProfilePath == nullptr || runtimePath == nullptr || runtimePathSize == 0)
+        return false;
+
+    const char *home = getenv("HOME");
+    if (home == nullptr || home[0] == '\0')
+    {
+        fprintf(stderr, "[CONTRA-SETTINGS] HOME is unavailable; using bundled profile\n");
+        return false;
+    }
+
+    auto settings = IOSLoadContraSettings();
+    fprintf(stderr, "[CONTRA-SETTINGS] runtime-overlay-version=1 settings='%s'\n",
+            IOSContraSettingsPath().string().c_str());
+    const std::string controlBar =
+        IOSContraLower(IOSContraSetting(settings, "ControlBar", "Contra"));
+    if (forceFullViewport != nullptr)
+        *forceFullViewport = controlBar == "pro";
+
+    std::filesystem::path source(sourceProfilePath);
+    std::filesystem::path runtime =
+        std::filesystem::path(home) / "Documents" / "ContraRuntime";
+
+    std::error_code ec;
+    std::filesystem::remove_all(runtime, ec);
+    ec.clear();
+    std::filesystem::create_directories(runtime, ec);
+    if (ec)
+    {
+        fprintf(stderr, "[CONTRA-SETTINGS] failed to create runtime profile: %s\n",
+                ec.message().c_str());
+        return false;
+    }
+
+    int activeArchives = 0;
+    int inactiveArchives = 0;
+    int linkedEntries = 0;
+
+    for (std::filesystem::directory_iterator it(source, ec), end; !ec && it != end; it.increment(ec))
+    {
+        const std::filesystem::path sourceEntry = it->path();
+        std::filesystem::path targetName = sourceEntry.filename();
+
+        std::error_code typeError;
+        if (it->is_directory(typeError) && !typeError)
+        {
+            std::filesystem::path target = runtime / targetName;
+            std::error_code linkError;
+            std::filesystem::create_directory_symlink(sourceEntry, target, linkError);
+            if (linkError)
+            {
+                fprintf(stderr,
+                        "[CONTRA-SETTINGS] directory-link-failed source='%s' error='%s'\n",
+                        sourceEntry.string().c_str(),
+                        linkError.message().c_str());
+                return false;
+            }
+            ++linkedEntries;
+            continue;
+        }
+
+        std::string ext = IOSContraLower(sourceEntry.extension().string());
+        if (ext == ".big" || ext == ".ctr")
+        {
+            const bool active = IOSContraArchiveShouldBeActive(sourceEntry, settings);
+            targetName.replace_extension(active ? ".big" : ".ctr");
+
+            // Contra's optional control-bar packs are named with a leading "!!".
+            // Our portable BIG loader sorts filenames ascending and, for -mod
+            // directories, later archives overwrite earlier ones. That means
+            // !ContraXBeta2_Window.big can otherwise overwrite the selected
+            // !!...ControlBarPro/Standard archive, making every launcher choice
+            // look identical. Give the selected control-bar overlay an explicit
+            // last-sorting runtime name so it wins only when that option is active.
+            std::string normalizedArchiveName = IOSContraLower(sourceEntry.filename().string());
+            if (active &&
+                (IOSContraEndsWith(normalizedArchiveName, "_controlbarpro.ctr") ||
+                 IOSContraEndsWith(normalizedArchiveName, "_controlbarstandard.ctr") ||
+                 IOSContraEndsWith(normalizedArchiveName, "_controlbarpro.big") ||
+                 IOSContraEndsWith(normalizedArchiveName, "_controlbarstandard.big")))
+            {
+                targetName = "zzzz__IOS_Selected_ControlBar.big";
+                fprintf(stderr,
+                        "[CONTRA-SETTINGS] controlbar-priority source='%s' runtime='%s'\n",
+                        sourceEntry.filename().string().c_str(),
+                        targetName.string().c_str());
+            }
+
+            if (active)
+                ++activeArchives;
+            else
+                ++inactiveArchives;
+
+            fprintf(stderr,
+                    "[CONTRA-SETTINGS] archive='%s' state=%s runtime='%s'\n",
+                    sourceEntry.filename().string().c_str(),
+                    active ? "active" : "inactive",
+                    targetName.string().c_str());
+        }
+
+        std::filesystem::path target = runtime / targetName;
+        std::error_code linkError;
+        std::filesystem::create_symlink(sourceEntry, target, linkError);
+        if (linkError)
+        {
+            fprintf(stderr,
+                    "[CONTRA-SETTINGS] file-link-failed source='%s' target='%s' error='%s'\n",
+                    sourceEntry.string().c_str(),
+                    target.string().c_str(),
+                    linkError.message().c_str());
+            return false;
+        }
+        ++linkedEntries;
+    }
+
+    if (ec)
+    {
+        fprintf(stderr, "[CONTRA-SETTINGS] runtime scan failed: %s\n", ec.message().c_str());
+        return false;
+    }
+
+    const std::string runtimeString = runtime.string();
+    if (runtimeString.size() + 1 > runtimePathSize)
+    {
+        fprintf(stderr, "[CONTRA-SETTINGS] runtime path is too long\n");
+        return false;
+    }
+    strlcpy(runtimePath, runtimeString.c_str(), runtimePathSize);
+
+    fprintf(stderr,
+            "[CONTRA-SETTINGS] runtime-ready path='%s' controlBar='%s' cameos='%s' music='%s' voices='%s' hotkeys='%s/%s' active=%d inactive=%d entries=%d forceFullViewport=%d\n",
+            runtimePath,
+            IOSContraSetting(settings, "ControlBar", "Contra").c_str(),
+            IOSContraSetting(settings, "Cameos", "Standard").c_str(),
+            IOSContraSetting(settings, "Music", "Standard").c_str(),
+            IOSContraSetting(settings, "UnitVoices", "English").c_str(),
+            IOSContraSetting(settings, "Hotkeys", "Original").c_str(),
+            IOSContraSetting(settings, "HotkeyLanguage", "English").c_str(),
+            activeArchives,
+            inactiveArchives,
+            linkedEntries,
+            forceFullViewport != nullptr && *forceFullViewport ? 1 : 0);
+
+    return true;
+}
+
+static bool IOSPrepareEnhancedRuntimeProfile(
+    const char *sourceProfilePath,
+    char *runtimePath,
+    size_t runtimePathSize)
+{
+    if (sourceProfilePath == nullptr || runtimePath == nullptr || runtimePathSize == 0)
+        return false;
+
+    const char *home = getenv("HOME");
+    if (home == nullptr || home[0] == '\0')
+    {
+        fprintf(stderr, "[ENHANCED-SETTINGS] HOME is unavailable; using bundled profile\n");
+        return false;
+    }
+
+    auto settings = IOSLoadEnhancedSettings();
+    const std::string textureResolution =
+        IOSContraLower(IOSEnhancedSetting(settings, "TextureResolution", "High"));
+    const std::string uiQuality =
+        IOSContraLower(IOSEnhancedSetting(settings, "UIQuality", "FHD"));
+    const std::string infantryIconScale =
+        IOSContraLower(IOSEnhancedSetting(settings, "InfantryIconScale", "100"));
+    const std::string cameos =
+        IOSContraLower(IOSEnhancedSetting(settings, "Cameos", "HD"));
+    const std::string aiScripts =
+        IOSContraLower(IOSEnhancedSetting(settings, "AIScripts", "Default"));
+
+    std::filesystem::path source(sourceProfilePath);
+    std::filesystem::path runtime =
+        std::filesystem::path(home) / "Documents" / "EnhancedRuntime";
+
+    std::error_code ec;
+    std::filesystem::remove_all(runtime, ec);
+    ec.clear();
+    std::filesystem::create_directories(runtime, ec);
+    if (ec)
+    {
+        fprintf(stderr, "[ENHANCED-SETTINGS] failed to create runtime profile: %s\n",
+                ec.message().c_str());
+        return false;
+    }
+
+    int activeArchives = 0;
+    int inactiveArchives = 0;
+    int linkedEntries = 0;
+
+    for (std::filesystem::directory_iterator it(source, ec), end; !ec && it != end; it.increment(ec))
+    {
+        const std::filesystem::path sourceEntry = it->path();
+        std::filesystem::path targetName = sourceEntry.filename();
+        std::string lowerName = IOSContraLower(sourceEntry.filename().string());
+
+        std::error_code typeError;
+        if (it->is_directory(typeError) && !typeError)
+        {
+            if (lowerName == "optional")
+                continue;
+
+            if (lowerName == "data")
+            {
+                std::filesystem::path runtimeData = runtime / "Data";
+                std::filesystem::create_directories(runtimeData, ec);
+                if (ec)
+                    return false;
+
+                std::error_code dataError;
+                for (std::filesystem::directory_iterator dit(sourceEntry, dataError), dend;
+                     !dataError && dit != dend;
+                     dit.increment(dataError))
+                {
+                    if (IOSContraLower(dit->path().filename().string()) == "scripts")
+                        continue;
+                    std::filesystem::create_symlink(
+                        dit->path(), runtimeData / dit->path().filename(), dataError);
+                    if (dataError)
+                        break;
+                }
+                if (dataError)
+                {
+                    fprintf(stderr, "[ENHANCED-SETTINGS] Data overlay failed: %s\n",
+                            dataError.message().c_str());
+                    return false;
+                }
+
+                std::filesystem::path scriptsSource = sourceEntry / "Scripts";
+                if (aiScripts == "restrained")
+                    scriptsSource = source / "Optional" / "AI" / "Restrained" / "Scripts";
+                else if (aiScripts == "skynet")
+                    scriptsSource = source / "Optional" / "AI" / "Skynet" / "Scripts";
+
+                if (!std::filesystem::exists(scriptsSource, dataError) || dataError)
+                {
+                    fprintf(stderr,
+                            "[ENHANCED-SETTINGS] selected AI scripts missing at '%s'; using default\n",
+                            scriptsSource.string().c_str());
+                    dataError.clear();
+                    scriptsSource = sourceEntry / "Scripts";
+                }
+                std::filesystem::create_directory_symlink(
+                    scriptsSource, runtimeData / "Scripts", dataError);
+                if (dataError)
+                {
+                    fprintf(stderr, "[ENHANCED-SETTINGS] Scripts link failed: %s\n",
+                            dataError.message().c_str());
+                    return false;
+                }
+                ++linkedEntries;
+                continue;
+            }
+
+            std::filesystem::create_directory_symlink(
+                sourceEntry, runtime / targetName, ec);
+            if (ec)
+            {
+                fprintf(stderr, "[ENHANCED-SETTINGS] directory link failed: %s\n",
+                        ec.message().c_str());
+                return false;
+            }
+            ++linkedEntries;
+            continue;
+        }
+
+        std::string ext = IOSContraLower(sourceEntry.extension().string());
+        if (ext == ".big" || ext == ".zhe")
+        {
+            bool active = ext == ".big";
+            const bool baseHD = lowerName.find("!zhe8texturesbasehd_") == 0;
+            const bool cameoHD = lowerName == "!zhe8cameohd_99.big" || lowerName == "!zhe8cameohd_99.zhe";
+            const bool cameoSD = lowerName == "!zhe8cameosd_99.big" || lowerName == "!zhe8cameosd_99.zhe";
+            const bool uiFHD = lowerName == "!zhe8uifhd_99.big" || lowerName == "!zhe8uifhd_99.zhe";
+            const bool uiHD = lowerName == "!zhe8uihd_99.big" || lowerName == "!zhe8uihd_99.zhe";
+            const bool uiQHD = lowerName == "!zhe8uiqhd_99.big" || lowerName == "!zhe8uiqhd_99.zhe";
+            const bool icons100 = lowerName == "!zhe8iui_97.big" || lowerName == "!zhe8iui_97.zhe";
+            const bool icons75 = lowerName == "!zhe8iui_98.big" || lowerName == "!zhe8iui_98.zhe";
+            const bool icons50 = lowerName == "!zhe8iui_99.big" || lowerName == "!zhe8iui_99.zhe";
+            const bool defaultAI = lowerName == "scriptszh.big" || lowerName == "scriptszh.zhe";
+            const bool restrainedAI = lowerName == "!zhe8airestrained_99.big" || lowerName == "!zhe8airestrained_99.zhe";
+            const bool skynetAI = lowerName == "!zhe8aiskynet_99.big" || lowerName == "!zhe8aiskynet_99.zhe";
+
+            if (baseHD)
+                active = textureResolution == "high";
+            else if (icons100 || icons75 || icons50)
+                active = (infantryIconScale == "100" && icons100) ||
+                         (infantryIconScale == "75" && icons75) ||
+                         (infantryIconScale == "50" && icons50);
+            else if (cameoHD || cameoSD)
+                active = (cameos == "hd" && cameoHD) || (cameos == "sd" && cameoSD);
+            else if (uiFHD || uiHD || uiQHD)
+                active = (uiQuality == "fhd" && uiFHD) ||
+                         (uiQuality == "hd" && uiHD) ||
+                         (uiQuality == "qhd" && uiQHD);
+            else if (defaultAI)
+                active = aiScripts != "restrained" && aiScripts != "skynet";
+            else if (restrainedAI || skynetAI)
+                active = (aiScripts == "restrained" && restrainedAI) ||
+                         (aiScripts == "skynet" && skynetAI);
+
+            targetName.replace_extension(active ? ".big" : ".zhe");
+            if (active && baseHD)
+                targetName = "zzzz__IOS_Enhanced_FactionHD_" + sourceEntry.stem().string() + ".big";
+            else if (active && (icons100 || icons75 || icons50))
+                targetName = "zzzz__IOS_Enhanced_InfantryIcons.big";
+            else if (active && (cameoHD || cameoSD))
+                targetName = "zzzz__IOS_Enhanced_Cameos.big";
+            else if (active && (uiFHD || uiHD || uiQHD))
+                targetName = "zzzz__IOS_Enhanced_UI.big";
+            else if (active && (restrainedAI || skynetAI))
+                targetName = "zzzz__IOS_Enhanced_AI.big";
+
+            if (active)
+                ++activeArchives;
+            else
+                ++inactiveArchives;
+
+            if (baseHD || icons100 || icons75 || icons50 || cameoHD || cameoSD || uiFHD || uiHD || uiQHD || defaultAI || restrainedAI || skynetAI)
+            {
+                const char *category = baseHD ? "faction-textures" :
+                    ((icons100 || icons75 || icons50) ? "infantry-icons" :
+                    ((cameoHD || cameoSD) ? "cameos" :
+                    ((uiFHD || uiHD || uiQHD) ? "ui" : "ai")));
+                fprintf(stderr,
+                        "[ENHANCED-SETTINGS] archive='%s' category=%s state=%s runtime='%s'\n",
+                        sourceEntry.filename().string().c_str(),
+                        category,
+                        active ? "active" : "inactive",
+                        targetName.string().c_str());
+            }
+        }
+
+        std::filesystem::create_symlink(sourceEntry, runtime / targetName, ec);
+        if (ec)
+        {
+            fprintf(stderr, "[ENHANCED-SETTINGS] file link failed source='%s' error='%s'\n",
+                    sourceEntry.string().c_str(), ec.message().c_str());
+            return false;
+        }
+        ++linkedEntries;
+    }
+
+    if (ec)
+    {
+        fprintf(stderr, "[ENHANCED-SETTINGS] runtime scan failed: %s\n", ec.message().c_str());
+        return false;
+    }
+
+    const std::string runtimeString = runtime.string();
+    if (runtimeString.size() + 1 > runtimePathSize)
+        return false;
+    strlcpy(runtimePath, runtimeString.c_str(), runtimePathSize);
+
+    fprintf(stderr,
+            "[ENHANCED-SETTINGS] runtime-ready path='%s' textures='%s' ui='%s' infantryIcons='%s%%' cameos='%s' ai='%s' active=%d inactive=%d entries=%d\n",
+            runtimePath,
+            IOSEnhancedSetting(settings, "TextureResolution", "High").c_str(),
+            IOSEnhancedSetting(settings, "UIQuality", "FHD").c_str(),
+            IOSEnhancedSetting(settings, "InfantryIconScale", "100").c_str(),
+            IOSEnhancedSetting(settings, "Cameos", "HD").c_str(),
+            IOSEnhancedSetting(settings, "AIScripts", "Default").c_str(),
+            activeArchives,
+            inactiveArchives,
+            linkedEntries);
+    return true;
+}
+
+static void LogIOSProfileContents(const char *modPath)
+{
+    if (modPath == nullptr || modPath[0] == '\0')
+        return;
+
+    fprintf(stderr, "[CONTRA-DIAG] profile-path=%s\n", modPath);
+
+    std::error_code ec;
+    std::filesystem::path root(modPath);
+    std::filesystem::recursive_directory_iterator it(
+        root,
+        std::filesystem::directory_options::follow_directory_symlink,
+        ec);
+    std::filesystem::recursive_directory_iterator end;
+
+    int activeBigCount = 0;
+    int inactiveCtrCount = 0;
+    for (; !ec && it != end; it.increment(ec))
+    {
+        std::error_code typeError;
+        if (!it->is_regular_file(typeError) || typeError)
+            continue;
+
+        std::string ext = it->path().extension().string();
+        for (char &c : ext)
+            c = (char)std::tolower((unsigned char)c);
+
+        if (ext == ".big")
+        {
+            ++activeBigCount;
+            std::error_code relError;
+            std::filesystem::path rel = std::filesystem::relative(it->path(), root, relError);
+            fprintf(stderr, "[CONTRA-DIAG] active-big=%s\n",
+                    (relError ? it->path() : rel).string().c_str());
+        }
+        else if (ext == ".ctr")
+        {
+            ++inactiveCtrCount;
+        }
+    }
+
+    if (ec)
+        fprintf(stderr, "[CONTRA-DIAG] profile-scan-error=%s\n", ec.message().c_str());
+
+    std::error_code scriptsError;
+    bool scripts = std::filesystem::exists(root / "Data" / "Scripts", scriptsError);
+    scriptsError.clear();
+    bool scripts1 = std::filesystem::exists(root / "Data" / "Scripts1", scriptsError);
+
+    fprintf(stderr,
+            "[CONTRA-DIAG] active-big-count=%d inactive-ctr-count=%d Data/Scripts=%s Data/Scripts1=%s\n",
+            activeBigCount,
+            inactiveCtrCount,
+            scripts ? "yes" : "no",
+            scripts1 ? "yes" : "no");
+}
+
+// GeneralsX @feature dvorovrus 25/09/2026 Convert the launcher's profile choice
+// into the engine's existing -mod directory mechanism. Base assets remain in
+// GameData; mod-only overlays live outside it in <bundle>/Profiles so vanilla
+// never sees Enhanced/Contra archives unless explicitly selected.
+static void InjectIOSProfileModArgument(const char *profileId)
+{
+    if (profileId == nullptr || strcmp(profileId, "vanilla") == 0)
+        return;
+
+    for (int i = 1; i < __argc; ++i)
+    {
+        if (__argv[i] != nullptr &&
+            (strcmp(__argv[i], "-mod") == 0 || strcmp(__argv[i], "--mod") == 0))
+        {
+            fprintf(stderr, "INFO: iOS launcher: explicit -mod already present, keeping caller override\n");
+            return;
+        }
+    }
+
+    const char *profileDir = nullptr;
+    if (strcmp(profileId, "enhanced") == 0)
+        profileDir = "enhanced";
+    else if (strcmp(profileId, "contra-x") == 0)
+        profileDir = "contra-x";
+    else
+        return;
+
+    const bool isEnhanced = strcmp(profileId, "enhanced") == 0;
+    const bool isContra = strcmp(profileId, "contra-x") == 0;
+
+    if (__argc <= 0 || __argv[0] == nullptr)
+        return;
+
+    const char *slash = strrchr(__argv[0], '/');
+    if (slash == nullptr)
+        return;
+
+    const size_t appDirLength = (size_t)(slash - __argv[0]);
+    static char bundledModPath[1024];
+    if (appDirLength + strlen(profileDir) + 12 >= sizeof(bundledModPath))
+    {
+        fprintf(stderr, "ERROR: iOS launcher: profile path is too long\n");
+        return;
+    }
+
+    memcpy(bundledModPath, __argv[0], appDirLength);
+    bundledModPath[appDirLength] = '\0';
+    strncat(bundledModPath, "/Profiles/", sizeof(bundledModPath) - strlen(bundledModPath) - 1);
+    strncat(bundledModPath, profileDir, sizeof(bundledModPath) - strlen(bundledModPath) - 1);
+
+    if (access(bundledModPath, R_OK) != 0)
+    {
+        fprintf(stderr, "ERROR: iOS launcher: selected profile '%s' is missing at %s\n",
+                profileId, bundledModPath);
+        return;
+    }
+
+    static char runtimeModPath[1024];
+    const char *selectedModPath = bundledModPath;
+    bool forceFullViewport = false;
+
+    if (isEnhanced &&
+        IOSPrepareEnhancedRuntimeProfile(
+            bundledModPath,
+            runtimeModPath,
+            sizeof(runtimeModPath)))
+    {
+        selectedModPath = runtimeModPath;
+    }
+    else if (isEnhanced)
+    {
+        fprintf(stderr,
+                "[ENHANCED-SETTINGS] runtime overlay unavailable; using bundled profile\n");
+    }
+    else if (isContra &&
+        IOSPrepareContraRuntimeProfile(
+            bundledModPath,
+            runtimeModPath,
+            sizeof(runtimeModPath),
+            &forceFullViewport))
+    {
+        selectedModPath = runtimeModPath;
+    }
+    else if (isContra)
+    {
+        auto settings = IOSLoadContraSettings();
+        forceFullViewport =
+            IOSContraLower(IOSContraSetting(settings, "ControlBar", "Contra")) == "pro";
+        fprintf(stderr,
+                "[CONTRA-SETTINGS] runtime overlay unavailable; using bundled profile\n");
+    }
+
+    static char modFlag[] = "-mod";
+    static char forceFullViewportFlag[] = "-forcefullviewport";
+    static char *profileArgv[64];
+    int count = 0;
+    const int maxBaseArgs = forceFullViewport ? 60 : 61;
+    for (int i = 0; i < __argc && count < maxBaseArgs; ++i)
+        profileArgv[count++] = __argv[i];
+
+    profileArgv[count++] = modFlag;
+    profileArgv[count++] = const_cast<char *>(selectedModPath);
+
+    // Control Bar Pro expects GenTool-style full viewport behavior. Contra's
+    // native and standard control bars intentionally do not enable this flag.
+    if (forceFullViewport)
+        profileArgv[count++] = forceFullViewportFlag;
+
+    profileArgv[count] = nullptr;
+
+    __argv = profileArgv;
+    __argc = count;
+
+    fprintf(stderr, "INFO: iOS launcher: profile '%s' -> -mod %s%s\n",
+            profileId,
+            selectedModPath,
+            forceFullViewport ? " -forcefullviewport" : "");
+
+    if (isContra)
+        LogIOSProfileContents(selectedModPath);
+}
+
+static int g_iosDiagnosticLogFd = -1;
+static size_t g_iosDiagnosticLogWritten = 0;
+static bool g_iosDiagnosticLogCapMarked = false;
+
+static void IOSDiagnosticArchivePath(const char *home, int index, char *outPath, size_t outSize)
+{
+	snprintf(outPath, outSize, "%s/Documents/generals-stderr-%02d.log", home, index);
+}
+
+void GeneralsXClearIOSDiagnosticLogs()
+{
+	const char *home = getenv("HOME");
+	if (home == nullptr || home[0] == '\0')
+		return;
+
+	fflush(stderr);
+
+	for (int index = 1; index <= 9; ++index)
+	{
+		char archivePath[1024];
+		IOSDiagnosticArchivePath(home, index, archivePath, sizeof(archivePath));
+		remove(archivePath);
+	}
+
+	char legacyPrevPath[1024];
+	snprintf(legacyPrevPath, sizeof(legacyPrevPath), "%s/Documents/generals-stderr-prev.log", home);
+	remove(legacyPrevPath);
+
+	if (g_iosDiagnosticLogFd >= 0)
+	{
+		ftruncate(g_iosDiagnosticLogFd, 0);
+		lseek(g_iosDiagnosticLogFd, 0, SEEK_SET);
+		g_iosDiagnosticLogWritten = 0;
+		g_iosDiagnosticLogCapMarked = false;
+	}
+	else
+	{
+		char currentPath[1024];
+		snprintf(currentPath, sizeof(currentPath), "%s/Documents/generals-stderr.log", home);
+		remove(currentPath);
+	}
+
+	fprintf(stderr, "INFO: diagnostic log history cleared by user\n");
+}
+
+#endif
+
+#if defined(__APPLE__) && (!defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE)
+static void MacFatalSignalHandler(int signalNumber)
+{
+	char header[128];
+	const int headerLength = snprintf(header, sizeof(header),
+	                                  "\n[FATAL-SIGNAL] signal=%d\n[FATAL-SIGNAL] native backtrace follows:\n",
+	                                  signalNumber);
+	if (headerLength > 0)
+	{
+		write(STDERR_FILENO, header, (size_t)headerLength);
+	}
+
+	void *frames[64];
+	const int frameCount = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
+	if (frameCount > 0)
+	{
+		backtrace_symbols_fd(frames, frameCount, STDERR_FILENO);
+	}
+	_exit(128 + signalNumber);
+}
+
+static void InstallMacFatalSignalHandlers()
+{
+	struct sigaction action = {};
+	action.sa_handler = MacFatalSignalHandler;
+	sigemptyset(&action.sa_mask);
+	action.sa_flags = SA_RESETHAND;
+
+	const int signals[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE };
+	for (const int signalNumber : signals)
+	{
+		sigaction(signalNumber, &action, nullptr);
+	}
+}
+#endif
+
 int main(int argc, char* argv[])
 {
 	int exitcode = 1;
+
+#if defined(__APPLE__) && (!defined(TARGET_OS_IPHONE) || !TARGET_OS_IPHONE)
+	InstallMacFatalSignalHandlers();
+	fprintf(stderr, "[CRASH-DIAG] macOS fatal-signal backtrace handlers installed\n");
+#endif
 
 	// TheSuperHackers @build felipebraz 13/02/2026
 	// Store command line arguments in globals for CommandLine.cpp parser
@@ -255,74 +1108,121 @@ int main(int argc, char* argv[])
 	__argv = argv;
 
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-	// Diagnostic capture: an icon-launched app's stderr goes nowhere we can read,
-	// so mirror it to a file in Library/Caches (purgeable, not user-visible). This
-	// lets us pull a full engine log after an on-device session — essential for
-	// debugging mode-specific issues (e.g. Generals Challenge radar/scripts) that
-	// only the user can reproduce. Pull with: devicectl ... copy from
-	// Library/Caches/generals-stderr.log. Remove once the relevant bugs are fixed.
+	// Diagnostic capture: keep the current launch plus the nine previous app
+	// sessions in Documents. Each process launch is one session, so reproducing
+	// an intermittent crash no longer loses the useful log after reopening the app.
 	{
-		// Quiet DXVK at the source: the d3d8 layer's per-call warns (e.g. an
-		// unimplemented render state set every frame) wrote hundreds of MB per
-		// long session. The shipped dxvk.conf also sets logLevel=none; the env
-		// covers modules that read it before the config.
 		setenv("DXVK_LOG_LEVEL", "none", 0);
 		const char *diagHome = getenv("HOME");
-		if (diagHome != nullptr) {
+		if (diagHome != nullptr)
+		{
 			char diagPath[1024];
-			char prevPath[1024];
-			// Documents, not Library/Caches: Caches is purgeable (a device restart or
-			// storage pressure can empty it), and Documents is user-reachable via the
-			// Files app since the bundle enables UIFileSharingEnabled.
+			char legacyPrevPath[1024];
 			snprintf(diagPath, sizeof(diagPath), "%s/Documents/generals-stderr.log", diagHome);
-			// Keep the previous session's log: a session that ends in a memory kill
-			// leaves no OS crash report, so the prior log is often the only evidence.
-			snprintf(prevPath, sizeof(prevPath), "%s/Documents/generals-stderr-prev.log", diagHome);
-			rename(diagPath, prevPath);
-			// Filtered + capped sink instead of a raw freopen: per-frame debug spam
-			// (upstream [GX-ISSUE144] font traces, [INI] loader traces, residual DXVK
-			// warns) is dropped, and the file stops growing at 8 MB so a marathon
-			// session cannot eat device storage. funopen() is fine here: this is
-			// Darwin-only code.
-			static int s_logFd = -1;
-			s_logFd = open(diagPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-			if (s_logFd >= 0) {
-				static size_t s_logWritten = 0;
+			snprintf(legacyPrevPath, sizeof(legacyPrevPath), "%s/Documents/generals-stderr-prev.log", diagHome);
+
+			bool hadArchiveHistory = false;
+			for (int index = 1; index <= 9; ++index)
+			{
+				char archivePath[1024];
+				IOSDiagnosticArchivePath(diagHome, index, archivePath, sizeof(archivePath));
+				if (access(archivePath, F_OK) == 0)
+				{
+					hadArchiveHistory = true;
+					break;
+				}
+			}
+
+			char oldestPath[1024];
+			IOSDiagnosticArchivePath(diagHome, 9, oldestPath, sizeof(oldestPath));
+			remove(oldestPath);
+			for (int index = 8; index >= 1; --index)
+			{
+				char sourcePath[1024];
+				char destinationPath[1024];
+				IOSDiagnosticArchivePath(diagHome, index, sourcePath, sizeof(sourcePath));
+				IOSDiagnosticArchivePath(diagHome, index + 1, destinationPath, sizeof(destinationPath));
+				if (access(sourcePath, F_OK) == 0)
+					rename(sourcePath, destinationPath);
+			}
+
+			const bool hadCurrentLog = access(diagPath, F_OK) == 0;
+			if (hadCurrentLog)
+			{
+				char newestArchivePath[1024];
+				IOSDiagnosticArchivePath(diagHome, 1, newestArchivePath, sizeof(newestArchivePath));
+				rename(diagPath, newestArchivePath);
+			}
+
+			// Migrate the old current/previous pair once when upgrading from the
+			// two-file scheme, preserving both sessions where possible.
+			if (access(legacyPrevPath, F_OK) == 0)
+			{
+				if (!hadArchiveHistory)
+				{
+					char migrationPath[1024];
+					IOSDiagnosticArchivePath(diagHome, hadCurrentLog ? 2 : 1, migrationPath, sizeof(migrationPath));
+					if (access(migrationPath, F_OK) != 0)
+						rename(legacyPrevPath, migrationPath);
+					else
+						remove(legacyPrevPath);
+				}
+				else
+				{
+					remove(legacyPrevPath);
+				}
+			}
+
+			g_iosDiagnosticLogFd = open(diagPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (g_iosDiagnosticLogFd >= 0)
+			{
+				g_iosDiagnosticLogWritten = 0;
+				g_iosDiagnosticLogCapMarked = false;
+
 				FILE *sink = funopen(nullptr,
 					nullptr,
 					[](void *, const char *buf, int len) -> int {
 						static const size_t kLogCap = 8u * 1024u * 1024u;
-						if (s_logFd < 0) return len;
+						if (g_iosDiagnosticLogFd < 0)
+							return len;
+
 						if (len > 13 &&
 						    (memcmp(buf, "[GX-ISSUE144]", 13) == 0 ||
 						     memcmp(buf, "[INI] ", 6) == 0 ||
-						     memcmp(buf, "warn:  D3D8De", 13) == 0)) {
-							return len;  // drop known per-frame spam, report consumed
+						     memcmp(buf, "warn:  D3D8De", 13) == 0))
+						{
+							return len;
 						}
-						if (s_logWritten >= kLogCap) {
-							// past the cap, still record errors — the tail of a dying
-							// session is this log's whole reason to exist
-							static bool s_capMarked = false;
-							if (!s_capMarked) {
-								s_capMarked = true;
+
+						if (g_iosDiagnosticLogWritten >= kLogCap)
+						{
+							if (!g_iosDiagnosticLogCapMarked)
+							{
+								g_iosDiagnosticLogCapMarked = true;
 								const char *mark = "[log capped: non-error lines dropped from here]\n";
-								write(s_logFd, mark, strlen(mark));
+								write(g_iosDiagnosticLogFd, mark, strlen(mark));
 							}
-							if (len > 4 && (memcmp(buf, "err:", 4) == 0 ||
-							                memcmp(buf, "ERROR", 5) == 0 ||
-							                memcmp(buf, "FATAL", 5) == 0)) {
-								write(s_logFd, buf, (size_t)len);
+							if (len > 4 &&
+							    (memcmp(buf, "err:", 4) == 0 ||
+							     memcmp(buf, "ERROR", 5) == 0 ||
+							     memcmp(buf, "FATAL", 5) == 0))
+							{
+								write(g_iosDiagnosticLogFd, buf, (size_t)len);
 							}
 							return len;
 						}
-						ssize_t w = write(s_logFd, buf, (size_t)len);
-						if (w > 0) s_logWritten += (size_t)w;
+
+						ssize_t written = write(g_iosDiagnosticLogFd, buf, (size_t)len);
+						if (written > 0)
+							g_iosDiagnosticLogWritten += (size_t)written;
 						return len;
 					},
 					nullptr, nullptr);
-				if (sink != nullptr) {
-					*stderr = *sink;  // classic Darwin stderr swap; stderr is a FILE, not a macro here
-					setvbuf(stderr, nullptr, _IOLBF, 0);  // line-buffered so a crash still flushes recent lines
+
+				if (sink != nullptr)
+				{
+					*stderr = *sink;
+					setvbuf(stderr, nullptr, _IOLBF, 0);
 				}
 			}
 		}
@@ -365,6 +1265,39 @@ int main(int argc, char* argv[])
 				fprintf(stderr, "WARNING: chdir(%s) failed: %s\n", docs, strerror(errno));
 			} else {
 				fprintf(stderr, "INFO: iOS working directory (Documents): %s\n", docs);
+				// Lite IPA: seed only redistributable fonts and default configuration.
+				// Leave proprietary game assets in Documents for the user to import.
+				// Never overwrite anything the user has already copied or customized.
+				if (bundleData[0] != '\0') {
+					const std::filesystem::path bootstrap =
+						std::filesystem::path(bundleData).parent_path() / "Bootstrap";
+					std::error_code ec;
+					const std::filesystem::path fontsDst = std::filesystem::path(docs) / "fonts";
+					std::filesystem::create_directories(fontsDst, ec);
+					for (const char *font : {"arial.ttf", "arialbold.ttf", "couriernew.ttf", "timesnewroman.ttf"}) {
+						const auto source = bootstrap / "fonts" / font;
+						if (std::filesystem::is_regular_file(source, ec)) {
+							std::filesystem::copy_file(source, fontsDst / font,
+								std::filesystem::copy_options::skip_existing, ec);
+						}
+						ec.clear();
+					}
+					const auto dxvkConfig = bootstrap / "dxvk.conf";
+					if (std::filesystem::is_regular_file(dxvkConfig, ec)) {
+						std::filesystem::copy_file(dxvkConfig, std::filesystem::path(docs) / "dxvk.conf",
+							std::filesystem::copy_options::skip_existing, ec);
+					}
+					ec.clear();
+					const auto defaultOptions = bootstrap / "DefaultOptions.ini";
+					if (std::filesystem::is_regular_file(defaultOptions, ec)) {
+						const std::filesystem::path userDir =
+							std::filesystem::path(home) / "Library/Application Support/GeneralsX/GeneralsZH";
+						std::filesystem::create_directories(userDir, ec);
+						ec.clear();
+						std::filesystem::copy_file(defaultOptions, userDir / "Options.ini",
+							std::filesystem::copy_options::skip_existing, ec);
+					}
+				}
 			}
 		}
 
@@ -384,6 +1317,44 @@ int main(int argc, char* argv[])
 				snprintf(userDataDir, sizeof(userDataDir),
 				         "%s/Library/Application Support/GeneralsX/GeneralsZH", home);
 				snprintf(optionsPath, sizeof(optionsPath), "%s/Options.ini", userDataDir);
+
+				// iPad File Sharing bridge: Files/iTunes/Apple Devices can only see
+				// Documents, while GeneralsX keeps writable user data in Library.
+				// If the user drops Options.ini or SagePatch.ini into Documents,
+				// mirror it into the normal user-data directory before GameMain()
+				// starts so every existing settings consumer sees it naturally.
+				{
+					std::error_code dirError;
+					std::filesystem::create_directories(userDataDir, dirError);
+
+					char docsDir[1024];
+					snprintf(docsDir, sizeof(docsDir), "%s/Documents", home);
+
+					auto syncEditableConfig = [&](const char *fileName) {
+						char sourcePath[1024], destinationPath[1024];
+						snprintf(sourcePath, sizeof(sourcePath), "%s/%s", docsDir, fileName);
+						snprintf(destinationPath, sizeof(destinationPath), "%s/%s", userDataDir, fileName);
+
+						if (access(sourcePath, R_OK) == 0) {
+							std::error_code copyError;
+							std::filesystem::copy_file(
+								sourcePath,
+								destinationPath,
+								std::filesystem::copy_options::overwrite_existing,
+								copyError);
+							if (!copyError) {
+								fprintf(stderr, "INFO: iPad File Sharing applied %s\n", fileName);
+							} else {
+								fprintf(stderr, "WARNING: failed to apply Documents/%s: %s\n",
+								        fileName, copyError.message().c_str());
+							}
+						}
+					};
+
+					syncEditableConfig("Options.ini");
+					syncEditableConfig("SagePatch.ini");
+				}
+
 				if (access(optionsPath, F_OK) != 0 && access("DefaultOptions.ini", R_OK) == 0) {
 					std::error_code fsError;
 					std::filesystem::create_directories(userDataDir, fsError);
@@ -453,6 +1424,16 @@ int main(int argc, char* argv[])
 		// TheSuperHackers @build felipebraz 10/02/2026 Phase 1.5
 		// Store argc/argv for CommandLine parser to access via _NSGetArgc/_NSGetArgv or /proc/self/cmdline
 		// For now, let CommandLine::parseCommandLineForStartup() handle this
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+		// GeneralsX @feature dvorovrus 25/09/2026 Show the bundled Vite launcher
+		// before command-line parsing, then inject the selected profile through
+		// the engine's native -mod directory support.
+		GeneralsXSetIOSDiagnosticClearCallback(GeneralsXClearIOSDiagnosticLogs);
+		const char *selectedProfile = GeneralsXRunIOSProfileLauncher();
+		fprintf(stderr, "INFO: iOS launcher selected profile: %s\n",
+		        selectedProfile != nullptr ? selectedProfile : "vanilla");
+		InjectIOSProfileModArgument(selectedProfile);
+#endif
 		CommandLine::parseCommandLineForStartup();
 
 		// GeneralsX @bugfix Copilot 17/05/2026 Skip SDL3 window bootstrap for CLI/headless replay execution.
@@ -471,6 +1452,8 @@ int main(int argc, char* argv[])
 		// SDL3GameEngine.cpp; SDL's automatic touch->mouse synthesis would
 		// double-deliver finger 1 and fight the two-finger pan logic.
 		SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+		// The first bottom-edge swipe reveals the indicator; the second exits.
+		SDL_SetHint(SDL_HINT_IOS_HIDE_HOME_INDICATOR, "2");
 #endif
 		if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
 			fprintf(stderr, "FATAL: Failed to initialize SDL3: %s\n", SDL_GetError());

@@ -58,6 +58,7 @@ xcodebuild -project "${IOS_DIR}/${APP_NAME}.xcodeproj" \
     -derivedDataPath "${DERIVED}" \
     DEVELOPMENT_TEAM="${TEAM_ID}" \
     PRODUCT_BUNDLE_IDENTIFIER="${BUNDLE_ID}" \
+    CODE_SIGNING_ALLOWED="$( [[ "${GX_UNSIGNED:-0}" == "1" ]] && echo NO || echo YES )" \
     -allowProvisioningUpdates build | tail -3
 
 SHELL_APP="${DERIVED}/Build/Products/Release-iphoneos/${APP_NAME}.app"
@@ -155,6 +156,23 @@ if [[ "${DEV_MODE}" != "1" ]]; then
     cp "${CONFIG_SRC}/dxvk.conf" "${APP}/GameData/dxvk.conf"
     cp "${CONFIG_SRC}/Options.ini" "${APP}/GameData/DefaultOptions.ini"
     echo "    bundled $(du -sh "${APP}/GameData" | cut -f1) of game data"
+else
+    # Keep GameData absent so the engine reads user-supplied assets from Documents.
+    # Small redistributable fonts/config are staged separately and copied into
+    # Documents on first launch (without overwriting user customisations).
+    echo "==> Embedding lite first-launch resources"
+    [[ -d "${FONTS_SRC}" ]] || { echo "ERROR: run stage-fonts.sh first" >&2; exit 1; }
+    mkdir -p "${APP}/Bootstrap/fonts"
+    for font in arial.ttf arialbold.ttf couriernew.ttf timesnewroman.ttf; do
+        [[ -f "${FONTS_SRC}/${font}" ]] || { echo "ERROR: missing staged font ${font}" >&2; exit 1; }
+        cp "${FONTS_SRC}/${font}" "${APP}/Bootstrap/fonts/"
+    done
+    for cfg in dxvk.conf Options.ini; do
+        [[ -f "${CONFIG_SRC}/${cfg}" ]] || { echo "ERROR: missing config ${cfg}" >&2; exit 1; }
+    done
+    cp "${CONFIG_SRC}/dxvk.conf" "${APP}/Bootstrap/dxvk.conf"
+    cp "${CONFIG_SRC}/Options.ini" "${APP}/Bootstrap/DefaultOptions.ini"
+    echo "    game assets excluded; lite bootstrap embedded"
 fi
 
 # Loose icon PNGs alongside the compiled asset catalog: SpringBoard on some
@@ -170,6 +188,12 @@ fi
 
 # Point the executable's rpath at the embedded frameworks
 install_name_tool -add_rpath "@executable_path/Frameworks" "${APP}/${APP_NAME}" 2>/dev/null || true
+
+if [[ "${GX_UNSIGNED:-0}" == "1" ]]; then
+    echo "==> Unsigned app assembled (requires signing before device installation)"
+    echo "==> App ready: ${APP}"
+    exit 0
+fi
 
 echo "==> Re-signing"
 ENTITLEMENTS="${OUT_DIR}/entitlements.plist"
