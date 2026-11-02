@@ -1,0 +1,68 @@
+name: Inspect Official Generals Demo
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/ios-lite-ipa]
+    paths:
+      - '.github/workflows/inspect-generals-demo.yml'
+permissions:
+  contents: read
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install extraction tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full cabextract unshield
+      - name: Download and verify official EA Generals demo
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+            'https://files.cncnz.com/generals/demo/c_cgeneralsdemo.exe' -o /tmp/generals-demo.exe
+          test "$(stat -c%s /tmp/generals-demo.exe)" = 423337984
+          echo '45a37bd8e62be316e8a66c97f641a165  /tmp/generals-demo.exe' | md5sum -c -
+          file /tmp/generals-demo.exe
+      - name: Inspect and extract demo safely
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p inspection unpacked extracted-data
+          7z l -slt /tmp/generals-demo.exe > inspection/archive-listing.txt 2>&1 || true
+          7z x -y /tmp/generals-demo.exe -ounpacked > inspection/extract.log 2>&1 || true
+          find unpacked -type f -printf '%P\t%s bytes\n' | sort > inspection/extracted-files.txt
+          find unpacked -type f \( -iname '*.cab' -o -iname '*.zip' -o -iname '*.big' \) -print > inspection/possible-assets.txt
+          while IFS= read -r f; do
+            case "$f" in
+              *.cab|*.CAB)
+                dest="unpacked/nested-$(basename "$f" | tr -cd '[:alnum:]')"
+                mkdir -p "$dest"
+                7z x -y "$f" "-o$dest" >> inspection/nested-extract.log 2>&1 || unshield x -d "$dest" "$f" >> inspection/nested-extract.log 2>&1 || true
+                ;;
+            esac
+          done < inspection/possible-assets.txt
+          find unpacked -type f -printf '%P\t%s bytes\n' | sort > inspection/all-files-after-extract.txt
+          find unpacked -type f -iname '*.big' -print > inspection/big-files.txt
+          echo "BIG archive count: $(wc -l < inspection/big-files.txt)"
+          cat inspection/big-files.txt
+          head -n 120 inspection/all-files-after-extract.txt
+          find unpacked -type f -iname '*.big' -exec cp -n -t extracted-data {} + || true
+          if find extracted-data -type f -print -quit | grep -q .; then
+            echo "Demo .big archives found and copied"
+          else
+            echo "No .big files directly extractable; inspect the text artifact for installer format"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Generals-demo-extraction-inspection
+          path: inspection/
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Generals-demo-extracted-big-files
+          path: extracted-data/
+          if-no-files-found: ignore
+          retention-days: 1
