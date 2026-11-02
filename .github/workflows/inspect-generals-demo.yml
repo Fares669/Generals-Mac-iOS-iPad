@@ -19,11 +19,28 @@ jobs:
       - name: Download and verify official EA Generals demo
         run: |
           set -euo pipefail
-          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
-            'https://files.cncnz.com/generals/demo/c_cgeneralsdemo.exe' -o /tmp/generals-demo.exe
-          test "$(stat -c%s /tmp/generals-demo.exe)" = 423337984
-          echo '45a37bd8e62be316e8a66c97f641a165  /tmp/generals-demo.exe' | md5sum -c -
-          file /tmp/generals-demo.exe
+          urls=(
+            'https://fmt5.dl.dbolical.com/dl/2016/09/21/c_cgeneralsdemo.exe?st=msPks30k5BmvzCjuBrPUgQ==&e=1793597911'
+            'https://www.moddb.com/downloads/mirror/111369/134/b7eab3669f8d650990d708c53189a960'
+            'https://files.cncnz.com/generals/demo/c_cgeneralsdemo.exe'
+          )
+          for i in "${!urls[@]}"; do
+            echo "Trying mirror $i"
+            if curl --silent --show-error --fail --location --retry 1 --connect-timeout 20 --max-time 180 \
+              --user-agent 'Mozilla/5.0 (compatible; GeneralsDemoVerifier/1.0)' \
+              --referer 'https://www.moddb.com/games/cc-generals/downloads/command-conquer-generals-demo' \
+              "${urls[$i]}" -o /tmp/generals-demo.exe; then
+              size="$(stat -c%s /tmp/generals-demo.exe)"
+              md5="$(md5sum /tmp/generals-demo.exe | cut -d' ' -f1)"
+              echo "Mirror $i returned size=$size hash=$md5"
+              if [[ "$size" == 423337984 && "$md5" == 45a37bd8e62be316e8a66c97f641a165 ]]; then
+                file /tmp/generals-demo.exe
+                exit 0
+              fi
+            fi
+          done
+          echo "No mirror returned a verified Generals demo installer" >&2
+          exit 1
       - name: Inspect and extract demo safely
         shell: bash
         run: |
